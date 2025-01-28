@@ -29,7 +29,9 @@ import (
 	"github.com/rook/rook/pkg/clusterd"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
+	"github.com/rook/rook/pkg/operator/ceph/cluster/nodedaemon"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/telemetry"
+	"github.com/rook/rook/pkg/operator/ceph/csi"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	testop "github.com/rook/rook/pkg/operator/test"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
@@ -80,80 +82,6 @@ func TestPreClusterStartValidation(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestPreMonChecks(t *testing.T) {
-	executor := &exectest.MockExecutor{}
-	context := &clusterd.Context{Executor: executor}
-	setSkipSanity := false
-	unsetSkipSanity := false
-	executor.MockExecuteCommandWithTimeout = func(timeout time.Duration, command string, args ...string) (string, error) {
-		logger.Infof("Command: %s %v", command, args)
-		if args[0] == "config" {
-			if args[1] == "set" {
-				setSkipSanity = true
-				assert.Equal(t, "mon", args[2])
-				assert.Equal(t, "mon_mds_skip_sanity", args[3])
-				assert.Equal(t, "1", args[4])
-				return "", nil
-			}
-			if args[1] == "rm" {
-				unsetSkipSanity = true
-				assert.Equal(t, "mon", args[2])
-				assert.Equal(t, "mon_mds_skip_sanity", args[3])
-				return "", nil
-			}
-		}
-		return "", errors.Errorf("unexpected ceph command %q", args)
-	}
-	c := cluster{context: context, ClusterInfo: cephclient.AdminTestClusterInfo("cluster")}
-
-	t.Run("no upgrade", func(t *testing.T) {
-		v := cephver.CephVersion{Major: 16, Minor: 2, Extra: 7}
-		c.isUpgrade = false
-		err := c.preMonStartupActions(v)
-		assert.NoError(t, err)
-		assert.False(t, setSkipSanity)
-		assert.False(t, unsetSkipSanity)
-	})
-
-	t.Run("upgrade below version", func(t *testing.T) {
-		setSkipSanity = false
-		unsetSkipSanity = false
-		v := cephver.CephVersion{Major: 16, Minor: 2, Extra: 6}
-		c.isUpgrade = true
-		err := c.preMonStartupActions(v)
-		assert.NoError(t, err)
-		assert.False(t, setSkipSanity)
-		assert.False(t, unsetSkipSanity)
-	})
-
-	t.Run("upgrade to applicable version", func(t *testing.T) {
-		setSkipSanity = false
-		unsetSkipSanity = false
-		v := cephver.CephVersion{Major: 16, Minor: 2, Extra: 7}
-		c.isUpgrade = true
-		err := c.preMonStartupActions(v)
-		assert.NoError(t, err)
-		assert.True(t, setSkipSanity)
-		assert.False(t, unsetSkipSanity)
-
-		// This will be called during the post mon checks
-		err = c.skipMDSSanityChecks(false)
-		assert.NoError(t, err)
-		assert.True(t, unsetSkipSanity)
-	})
-
-	t.Run("upgrade to quincy", func(t *testing.T) {
-		setSkipSanity = false
-		unsetSkipSanity = false
-		v := cephver.CephVersion{Major: 17, Minor: 2, Extra: 0}
-		c.isUpgrade = true
-		err := c.preMonStartupActions(v)
-		assert.NoError(t, err)
-		assert.False(t, setSkipSanity)
-		assert.False(t, unsetSkipSanity)
-	})
 }
 
 func TestConfigureMsgr2(t *testing.T) {
@@ -295,7 +223,8 @@ func TestConfigureMsgr2(t *testing.T) {
 
 func TestTelemetry(t *testing.T) {
 	var expectedSettings map[string]string
-	context := &clusterd.Context{Clientset: testop.New(t, 3)}
+	clientset := testop.New(t, 3)
+	context := &clusterd.Context{Clientset: clientset}
 	context.Executor = &exectest.MockExecutor{
 		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
 			logger.Infof("Command: %s %v", command, args)
@@ -316,9 +245,11 @@ func TestTelemetry(t *testing.T) {
 		context:     context,
 		ClusterInfo: cephclient.AdminTestClusterInfo("cluster"),
 		mons:        &mon.Cluster{},
+		Namespace:   "rook-ceph",
 	}
 
 	t.Run("normal cluster", func(t *testing.T) {
+		ns := "rook-ceph"
 		c.Spec = &cephv1.ClusterSpec{
 			Mon: cephv1.MonSpec{Count: 3, AllowMultiplePerNode: true},
 			Storage: cephv1.StorageScopeSpec{
@@ -328,7 +259,8 @@ func TestTelemetry(t *testing.T) {
 					{Name: "three", Count: 3, Portable: false},
 				},
 			},
-			Network: cephv1.NetworkSpec{Provider: "host"},
+			Network:        cephv1.NetworkSpec{Provider: "host"},
+			CrashCollector: cephv1.CrashCollectorSpec{Disable: false},
 		}
 		expectedSettings = map[string]string{
 			telemetry.K8sVersionKey:              "v0.0.0-master+$Format:%H$",
@@ -342,13 +274,45 @@ func TestTelemetry(t *testing.T) {
 			telemetry.DeviceSetNonPortableKey:    "1",
 			telemetry.NetworkProviderKey:         "host",
 			telemetry.ExternalModeEnabledKey:     "false",
+			telemetry.K8sNodeCount:               "3",
+			telemetry.CephFSNodeCount:            "0",
+			telemetry.RBDNodeCount:               "0",
+			telemetry.NFSNodeCount:               "0",
+			telemetry.CephNodeCount:              "0",
+		}
+		c.reportTelemetry()
+
+		// add some pods to the nodes
+		labels := make(map[string]string)
+		labels["app"] = nodedaemon.CrashCollectorAppName
+		testop.FakeCustomisePodCreate(t, clientset, "crash-collector", ns, labels)
+		labels["app"] = csi.CsiRBDPlugin
+		testop.FakeCustomisePodCreate(t, clientset, "csi-rbdplugin", ns, labels)
+		expectedSettings = map[string]string{
+			telemetry.K8sVersionKey:              "v0.0.0-master+$Format:%H$",
+			telemetry.MonMaxIDKey:                "0",
+			telemetry.MonCountKey:                "3",
+			telemetry.MonAllowMultiplePerNodeKey: "true",
+			telemetry.MonPVCEnabledKey:           "false",
+			telemetry.MonStretchEnabledKey:       "false",
+			telemetry.DeviceSetTotalKey:          "3",
+			telemetry.DeviceSetPortableKey:       "2",
+			telemetry.DeviceSetNonPortableKey:    "1",
+			telemetry.NetworkProviderKey:         "host",
+			telemetry.ExternalModeEnabledKey:     "false",
+			telemetry.K8sNodeCount:               "3",
+			telemetry.CephFSNodeCount:            "0",
+			telemetry.RBDNodeCount:               "1", //should be 1
+			telemetry.NFSNodeCount:               "0",
+			telemetry.CephNodeCount:              "1", //should be 1
 		}
 		c.reportTelemetry()
 	})
 
 	t.Run("external cluster", func(t *testing.T) {
 		c.Spec = &cephv1.ClusterSpec{
-			External: cephv1.ExternalSpec{Enable: true},
+			External:       cephv1.ExternalSpec{Enable: true},
+			CrashCollector: cephv1.CrashCollectorSpec{Disable: true},
 		}
 		expectedSettings = map[string]string{
 			telemetry.K8sVersionKey:              "v0.0.0-master+$Format:%H$",
@@ -362,7 +326,107 @@ func TestTelemetry(t *testing.T) {
 			telemetry.DeviceSetNonPortableKey:    "0",
 			telemetry.NetworkProviderKey:         "",
 			telemetry.ExternalModeEnabledKey:     "true",
+			telemetry.K8sNodeCount:               "3",
+			telemetry.CephFSNodeCount:            "0",
+			telemetry.RBDNodeCount:               "1",
+			telemetry.NFSNodeCount:               "0",
+			telemetry.CephNodeCount:              "-1", // checking the disable scenario
 		}
 		c.reportTelemetry()
+	})
+}
+func TestClusterFullSettings(t *testing.T) {
+	actualFullRatio := 0.95
+	actualBackfillFullRatio := 0.90
+	actualNearFullRatio := 0.85
+	setFullRatio := false
+	setBackfillFullRatio := false
+	setNearFullRatio := false
+	clientset := testop.New(t, 1)
+	context := &clusterd.Context{Clientset: clientset}
+	c := cluster{
+		context:     context,
+		ClusterInfo: cephclient.AdminTestClusterInfo("cluster"),
+		Spec:        &cephv1.ClusterSpec{},
+	}
+	context.Executor = &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			logger.Infof("Command: %s %v", command, args)
+			if args[0] == "osd" {
+				if args[1] == "dump" {
+					return fmt.Sprintf(
+						`{	"full_ratio": %.2f,
+					"backfillfull_ratio": %.2f,
+					"nearfull_ratio": %.2f}`, actualFullRatio, actualBackfillFullRatio, actualNearFullRatio), nil
+				}
+				if args[1] == "set-full-ratio" {
+					assert.Equal(t, fmt.Sprintf("%.2f", *c.Spec.Storage.FullRatio), args[2])
+					setFullRatio = true
+					return "", nil
+				}
+				if args[1] == "set-nearfull-ratio" {
+					assert.Equal(t, fmt.Sprintf("%.2f", *c.Spec.Storage.NearFullRatio), args[2])
+					setNearFullRatio = true
+					return "", nil
+				}
+				if args[1] == "set-backfillfull-ratio" {
+					assert.Equal(t, fmt.Sprintf("%.2f", *c.Spec.Storage.BackfillFullRatio), args[2])
+					setBackfillFullRatio = true
+					return "", nil
+				}
+			}
+			return "", errors.New("mock error to simulate failure of mon store config")
+		},
+	}
+	t.Run("no settings", func(t *testing.T) {
+		err := c.configureStorageSettings()
+		assert.NoError(t, err)
+		assert.False(t, setFullRatio)
+		assert.False(t, setNearFullRatio)
+		assert.False(t, setBackfillFullRatio)
+	})
+
+	val91 := 0.91
+	val90 := 0.90
+	val85 := 0.85
+	val80 := 0.80
+
+	t.Run("all settings applied", func(t *testing.T) {
+		c.Spec.Storage.FullRatio = &val90
+		c.Spec.Storage.NearFullRatio = &val80
+		c.Spec.Storage.BackfillFullRatio = &val85
+		err := c.configureStorageSettings()
+		assert.NoError(t, err)
+		assert.True(t, setFullRatio)
+		assert.True(t, setNearFullRatio)
+		assert.True(t, setBackfillFullRatio)
+	})
+
+	t.Run("no settings changed", func(t *testing.T) {
+		setFullRatio = false
+		setBackfillFullRatio = false
+		setNearFullRatio = false
+		c.Spec.Storage.FullRatio = &actualFullRatio
+		c.Spec.Storage.NearFullRatio = &actualNearFullRatio
+		c.Spec.Storage.BackfillFullRatio = &actualBackfillFullRatio
+		err := c.configureStorageSettings()
+		assert.NoError(t, err)
+		assert.False(t, setFullRatio)
+		assert.False(t, setNearFullRatio)
+		assert.False(t, setBackfillFullRatio)
+	})
+
+	t.Run("one setting applied", func(t *testing.T) {
+		setFullRatio = false
+		setBackfillFullRatio = false
+		setNearFullRatio = false
+		c.Spec.Storage.FullRatio = &val91
+		c.Spec.Storage.NearFullRatio = nil
+		c.Spec.Storage.BackfillFullRatio = nil
+		err := c.configureStorageSettings()
+		assert.NoError(t, err)
+		assert.True(t, setFullRatio)
+		assert.False(t, setNearFullRatio)
+		assert.False(t, setBackfillFullRatio)
 	})
 }

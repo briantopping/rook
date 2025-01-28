@@ -19,7 +19,6 @@ package object
 
 import (
 	"fmt"
-	"math/rand"
 	"net/http"
 	"os"
 	"reflect"
@@ -34,6 +33,7 @@ import (
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	"github.com/rook/rook/pkg/operator/ceph/config"
+	"github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/ceph/pool"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/rook/rook/pkg/util/exec"
@@ -61,6 +61,10 @@ type rgwConfig struct {
 	Realm        string
 	ZoneGroup    string
 	Zone         string
+
+	Auth           cephv1.AuthSpec
+	KeystoneSecret *v1.Secret
+	Protocols      cephv1.ProtocolSpec
 }
 
 var updateDeploymentAndWait = mon.UpdateCephDeploymentAndWait
@@ -69,10 +73,10 @@ var (
 	insecureSkipVerify = "insecureSkipVerify"
 )
 
-func (c *clusterConfig) createOrUpdateStore(realmName, zoneGroupName, zoneName string) error {
+func (c *clusterConfig) createOrUpdateStore(realmName, zoneGroupName, zoneName string, keystoneSecret *v1.Secret) error {
 	logger.Infof("creating object store %q in namespace %q", c.store.Name, c.store.Namespace)
 
-	if err := c.startRGWPods(realmName, zoneGroupName, zoneName); err != nil {
+	if err := c.startRGWPods(realmName, zoneGroupName, zoneName, keystoneSecret); err != nil {
 		return errors.Wrap(err, "failed to start rgw pods")
 	}
 
@@ -94,12 +98,17 @@ func (c *clusterConfig) createOrUpdateStore(realmName, zoneGroupName, zoneName s
 	return nil
 }
 
-func (c *clusterConfig) startRGWPods(realmName, zoneGroupName, zoneName string) error {
+func (c *clusterConfig) startRGWPods(realmName, zoneGroupName, zoneName string, keystoneSecret *v1.Secret) error {
 	// backward compatibility, triggered during updates
 	if c.store.Spec.Gateway.Instances < 1 {
 		// Set the minimum of at least one instance
 		logger.Warning("spec.gateway.instances must be set to at least 1")
 		c.store.Spec.Gateway.Instances = 1
+	}
+
+	rgwsToSkipReconcile, err := controller.GetDaemonsToSkipReconcile(c.clusterInfo.Context, c.context, c.clusterInfo.Namespace, config.RgwType, AppName)
+	if err != nil {
+		return errors.Wrap(err, "failed to check for RGWs to skip reconcile")
 	}
 
 	// start a new deployment and scale up
@@ -109,17 +118,26 @@ func (c *clusterConfig) startRGWPods(realmName, zoneGroupName, zoneName string) 
 		var err error
 
 		daemonLetterID := k8sutil.IndexToName(i)
+
+		if rgwsToSkipReconcile.Has(daemonLetterID) {
+			logger.Warningf("skipping reconcile of rgw daemon %q with label %q", daemonLetterID, cephv1.SkipReconcileLabelKey)
+			return nil
+		}
+
 		// Each rgw is id'ed by <store_name>-<letterID>
 		daemonName := fmt.Sprintf("%s-%s", c.store.Name, daemonLetterID)
 		// resource name is rook-ceph-rgw-<store_name>-<daemon_name>
 		resourceName := fmt.Sprintf("%s-%s-%s", AppName, c.store.Name, daemonLetterID)
 
 		rgwConfig := &rgwConfig{
-			ResourceName: resourceName,
-			DaemonID:     daemonName,
-			Realm:        realmName,
-			ZoneGroup:    zoneGroupName,
-			Zone:         zoneName,
+			ResourceName:   resourceName,
+			DaemonID:       daemonName,
+			Realm:          realmName,
+			ZoneGroup:      zoneGroupName,
+			Zone:           zoneName,
+			Auth:           c.store.Spec.Auth,
+			Protocols:      c.store.Spec.Protocols,
+			KeystoneSecret: keystoneSecret,
 		}
 
 		// We set the owner reference of the Secret to the Object controller instead of the replicaset
@@ -217,6 +235,7 @@ func (c *clusterConfig) startRGWPods(realmName, zoneGroupName, zoneName string) 
 		if err != nil {
 			logger.Warningf("could not get deployments for object store %q (matching label selector %q). %v", c.store.Name, c.storeLabelSelector(), err)
 		}
+
 		currentRgwInstances = len(deps.Items)
 		if currentRgwInstances == desiredRgwInstances {
 			logger.Infof("successfully scaled down rgw deployments to %d in object store %q", desiredRgwInstances, c.store.Name)
@@ -318,32 +337,11 @@ func EmptyPool(pool cephv1.PoolSpec) bool {
 	return reflect.DeepEqual(pool, cephv1.PoolSpec{})
 }
 
-// GetDomainName build the dns name to reach out the service endpoint
-func GetDomainName(s *cephv1.CephObjectStore) string {
-	return getDomainName(s, true)
-}
-
 func GetStableDomainName(s *cephv1.CephObjectStore) string {
-	return getDomainName(s, false)
-}
-
-func getDomainName(s *cephv1.CephObjectStore, returnRandomDomainIfMultiple bool) string {
-	if s.Spec.IsExternal() {
-		// if the store is external, pick a random endpoint to use. if the endpoint is down, this
-		// reconcile may fail, but a future reconcile will eventually pick a different endpoint to try
-		endpoints := s.Spec.Gateway.ExternalRgwEndpoints
-		idx := 0
-		if returnRandomDomainIfMultiple {
-			idx = rand.Intn(len(endpoints)) //nolint:gosec // G404: cryptographically weak RNG is fine here
-		}
-		return endpoints[idx].String()
+	if !s.Spec.IsExternal() {
+		return s.GetServiceDomainName()
 	}
-
-	return domainNameOfService(s)
-}
-
-func domainNameOfService(s *cephv1.CephObjectStore) string {
-	return fmt.Sprintf("%s-%s.%s.%s", AppName, s.Name, s.Namespace, svcDNSSuffix)
+	return s.Spec.Gateway.ExternalRgwEndpoints[0].String()
 }
 
 func getAllDomainNames(s *cephv1.CephObjectStore) []string {
@@ -356,7 +354,9 @@ func getAllDomainNames(s *cephv1.CephObjectStore) []string {
 		return domains
 	}
 
-	return []string{domainNameOfService(s)}
+	// do not return hosting.dnsNames in this list because Rook has no way of knowing for sure how
+	// they can be used. some might be TLS-only or non-TLS, or inaccessible from k8s
+	return []string{s.GetServiceDomainName()}
 }
 
 func getAllDNSEndpoints(s *cephv1.CephObjectStore, port int32, secure bool) []string {

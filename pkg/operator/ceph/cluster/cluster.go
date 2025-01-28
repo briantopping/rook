@@ -20,6 +20,8 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"math"
+	"os"
 	"os/exec"
 	"path"
 	"strconv"
@@ -219,6 +221,11 @@ func (c *ClusterController) initializeCluster(cluster *cluster) error {
 		go cluster.reportTelemetry()
 	}
 
+	err := csi.SaveCSIDriverOptions(c.context.Clientset, cluster.Namespace, cluster.ClusterInfo)
+	if err != nil {
+		return errors.Wrap(err, "failed to save CSI driver options")
+	}
+
 	// Populate ClusterInfo with the last value
 	cluster.mons.ClusterInfo = cluster.ClusterInfo
 	cluster.mons.ClusterInfo.SetName(c.namespacedName.Name)
@@ -244,13 +251,6 @@ func (c *ClusterController) configureLocalCephCluster(cluster *cluster) error {
 	}
 	// Set the value of isUpgrade based on the image discovery done by detectAndValidateCephVersion()
 	cluster.isUpgrade = isUpgrade
-
-	if cluster.Spec.IsStretchCluster() {
-		stretchVersion := cephver.CephVersion{Major: 16, Minor: 2, Build: 5}
-		if !cephVersion.IsAtLeast(stretchVersion) {
-			return errors.Errorf("stretch clusters minimum ceph version is %q, but is running %s", stretchVersion.String(), cephVersion.String())
-		}
-	}
 
 	if cluster.Spec.Network.MultiClusterService.Enabled {
 		serviceExportVersion := cephver.CephVersion{Major: 17, Minor: 2, Extra: 6}
@@ -444,32 +444,6 @@ func (c *cluster) replaceDefaultCrushMap(newRoot string) (err error) {
 
 // preMonStartupActions is a collection of actions to run before the monitors are reconciled.
 func (c *cluster) preMonStartupActions(cephVersion cephver.CephVersion) error {
-	// Disable the mds sanity checks for the mons due to a ceph upgrade issue
-	// for the mds to Pacific if 16.2.7 or greater. We keep it more general for any
-	// Pacific upgrade greater than 16.2.7 in case they skip upgrading directly to 16.2.7.
-	if c.isUpgrade && cephVersion.IsPacific() && cephVersion.IsAtLeast(cephver.CephVersion{Major: 16, Minor: 2, Extra: 7}) {
-		if err := c.skipMDSSanityChecks(true); err != nil {
-			// If there is an error, just print it and continue. Likely there is not a
-			// negative consequence of continuing since several complex conditions must exist to hit
-			// the upgrade issue where the sanity checks need to be disabled.
-			logger.Warningf("failed to disable the mon_mds_skip_sanity. %v", err)
-		}
-	}
-	return nil
-}
-
-func (c *cluster) skipMDSSanityChecks(skip bool) error {
-	// In a running cluster disable the mds skip sanity setting during upgrades.
-	monStore := config.GetMonStore(c.context, c.ClusterInfo)
-	if skip {
-		if err := monStore.Set("mon", "mon_mds_skip_sanity", "1"); err != nil {
-			return err
-		}
-	} else {
-		if err := monStore.Delete("mon", "mon_mds_skip_sanity"); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -478,28 +452,31 @@ func (c *cluster) skipMDSSanityChecks(skip bool) error {
 // Basically, it is executed between the monitors and the manager sequence
 func (c *cluster) postMonStartupActions() error {
 	// Create CSI Kubernetes Secrets
-	err := csi.CreateCSISecrets(c.context, c.ClusterInfo)
-	if err != nil {
+	if err := csi.CreateCSISecrets(c.context, c.ClusterInfo); err != nil {
 		return errors.Wrap(err, "failed to create csi kubernetes secrets")
 	}
 
 	// Create crash collector Kubernetes Secret
-	err = nodedaemon.CreateCrashCollectorSecret(c.context, c.ClusterInfo)
-	if err != nil {
+	if err := nodedaemon.CreateCrashCollectorSecret(c.context, c.ClusterInfo); err != nil {
 		return errors.Wrap(err, "failed to create crash collector kubernetes secret")
 	}
 
-	// Always ensure the skip mds sanity checks setting is cleared, for all Pacific deployments
-	if c.ClusterInfo.CephVersion.IsPacific() {
-		if err := c.skipMDSSanityChecks(false); err != nil {
-			// If there is an error, just print it and continue. We can just try again
-			// at the next reconcile.
-			logger.Warningf("failed to re-enable the mon_mds_skip_sanity. %v", err)
-		}
+	// Create exporter Kubernetes Secret
+	if err := nodedaemon.CreateExporterSecret(c.context, c.ClusterInfo); err != nil {
+		return errors.Wrap(err, "failed to create exporter kubernetes secret")
 	}
 
 	if err := c.configureMsgr2(); err != nil {
 		return errors.Wrap(err, "failed to configure msgr2")
+	}
+
+	// Set config store options
+	if err := c.updateConfigStoreFromCRD(); err != nil {
+		return errors.Wrap(err, "")
+	}
+
+	if err := c.configureStorageSettings(); err != nil {
+		return errors.Wrap(err, "failed to configure storage settings")
 	}
 
 	crushRoot := client.GetCrushRootFromSpec(c.Spec)
@@ -513,12 +490,75 @@ func (c *cluster) postMonStartupActions() error {
 	}
 
 	// Create cluster-wide RBD bootstrap peer token
-	_, err = controller.CreateBootstrapPeerSecret(c.context, c.ClusterInfo, &cephv1.CephCluster{ObjectMeta: metav1.ObjectMeta{Name: c.namespacedName.Name, Namespace: c.Namespace}}, c.ownerInfo)
-	if err != nil {
+	if _, err := controller.CreateBootstrapPeerSecret(c.context, c.ClusterInfo, &cephv1.CephCluster{ObjectMeta: metav1.ObjectMeta{Name: c.namespacedName.Name, Namespace: c.Namespace}}, c.ownerInfo); err != nil {
 		return errors.Wrap(err, "failed to create cluster rbd bootstrap peer token")
 	}
 
 	return nil
+}
+
+func (c *cluster) configureStorageSettings() error {
+	if !c.shouldSetClusterFullSettings() {
+		return nil
+	}
+	osdDump, err := client.GetOSDDump(c.context, c.ClusterInfo)
+	if err != nil {
+		return errors.Wrap(err, "failed to get osd dump for setting cluster full settings")
+	}
+
+	if err := c.setClusterFullRatio("set-full-ratio", c.Spec.Storage.FullRatio, osdDump.FullRatio); err != nil {
+		return err
+	}
+
+	if err := c.setClusterFullRatio("set-backfillfull-ratio", c.Spec.Storage.BackfillFullRatio, osdDump.BackfillFullRatio); err != nil {
+		return err
+	}
+
+	if err := c.setClusterFullRatio("set-nearfull-ratio", c.Spec.Storage.NearFullRatio, osdDump.NearFullRatio); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *cluster) setClusterFullRatio(ratioCommand string, desiredRatio *float64, actualRatio float64) error {
+	if !shouldUpdateFloatSetting(desiredRatio, actualRatio) {
+		if desiredRatio != nil {
+			logger.Infof("desired value %s=%.2f is already set", ratioCommand, *desiredRatio)
+		}
+		return nil
+	}
+	desiredStringVal := fmt.Sprintf("%.2f", *desiredRatio)
+	logger.Infof("updating %s from %.2f to %s", ratioCommand, actualRatio, desiredStringVal)
+	args := []string{"osd", ratioCommand, desiredStringVal}
+	cephCmd := client.NewCephCommand(c.context, c.ClusterInfo, args)
+	output, err := cephCmd.Run()
+	if err != nil {
+		return errors.Wrapf(err, "failed to update %s to %q. %s", ratioCommand, desiredStringVal, output)
+	}
+	return nil
+}
+
+func shouldUpdateFloatSetting(desired *float64, actual float64) bool {
+	if desired == nil {
+		return false
+	}
+	if *desired == actual {
+		return false
+	}
+	if actual != 0 && math.Abs(*desired-actual)/actual > 0.01 {
+		return true
+	}
+	return false
+}
+
+func (c *cluster) shouldSetClusterFullSettings() bool {
+	return c.Spec.Storage.FullRatio != nil || c.Spec.Storage.BackfillFullRatio != nil || c.Spec.Storage.NearFullRatio != nil
+}
+
+func (c *cluster) updateConfigStoreFromCRD() error {
+	monStore := config.GetMonStore(c.context, c.ClusterInfo)
+	return monStore.SetAllMultiple(c.Spec.CephConfig)
 }
 
 func (c *cluster) reportTelemetry() {
@@ -528,8 +568,14 @@ func (c *cluster) reportTelemetry() {
 	telemetryMutex.Lock()
 	defer telemetryMutex.Unlock()
 
-	// Identify this as a rook cluster for Ceph telemetry by setting the Rook version.
+	reportClusterTelemetry(c)
+	reportNodeTelemetry(c)
+}
+
+func reportClusterTelemetry(c *cluster) {
 	logger.Info("reporting cluster telemetry")
+
+	// Identify this as a rook cluster for Ceph telemetry by setting the Rook version.
 	telemetry.ReportKeyValue(c.context, c.ClusterInfo, telemetry.RookVersionKey, rookversion.Version)
 
 	// Report the K8s version
@@ -577,6 +623,58 @@ func (c *cluster) reportTelemetry() {
 	telemetry.ReportKeyValue(c.context, c.ClusterInfo, telemetry.ExternalModeEnabledKey, strconv.FormatBool(c.Spec.External.Enable))
 }
 
+func reportNodeTelemetry(c *cluster) {
+	logger.Info("reporting node telemetry")
+	operatorNamespace := os.Getenv(k8sutil.PodNamespaceEnvVar)
+
+	// Report the K8sNodeCount
+	nodelist, err := c.context.Clientset.CoreV1().Nodes().List(c.ClusterInfo.Context, metav1.ListOptions{})
+	if err != nil {
+		logger.Warningf("failed to report the K8s node count. %v", err)
+	} else {
+		telemetry.ReportKeyValue(c.context, c.ClusterInfo, telemetry.K8sNodeCount, strconv.Itoa(len(nodelist.Items)))
+	}
+
+	// Report the cephNodeCount
+	if c.Spec.CrashCollector.Disable {
+		telemetry.ReportKeyValue(c.context, c.ClusterInfo, telemetry.CephNodeCount, "-1")
+	} else {
+		listoption := metav1.ListOptions{LabelSelector: fmt.Sprintf("%s=%s", k8sutil.AppAttr, nodedaemon.CrashCollectorAppName)}
+		cephNodeList, err := c.context.Clientset.CoreV1().Pods(c.Namespace).List(c.ClusterInfo.Context, listoption)
+		if err != nil {
+			logger.Warningf("failed to report the ceph node count. %v", err)
+		} else {
+			telemetry.ReportKeyValue(c.context, c.ClusterInfo, telemetry.CephNodeCount, strconv.Itoa(len(cephNodeList.Items)))
+		}
+	}
+	// Report the csi rbd node count
+	listoption := metav1.ListOptions{LabelSelector: fmt.Sprintf("%s=%s", k8sutil.AppAttr, csi.CsiRBDPlugin)}
+	cephRbdNodelist, err := c.context.Clientset.CoreV1().Pods(operatorNamespace).List(c.ClusterInfo.Context, listoption)
+	if err != nil {
+		logger.Warningf("failed to report the ceph rbd node count. %v", err)
+	} else {
+		telemetry.ReportKeyValue(c.context, c.ClusterInfo, telemetry.RBDNodeCount, strconv.Itoa(len(cephRbdNodelist.Items)))
+	}
+
+	// Report the csi cephfs node count
+	listoption = metav1.ListOptions{LabelSelector: fmt.Sprintf("%s=%s", k8sutil.AppAttr, csi.CsiCephFSPlugin)}
+	cephFSNodelist, err := c.context.Clientset.CoreV1().Pods(operatorNamespace).List(c.ClusterInfo.Context, listoption)
+	if err != nil {
+		logger.Warningf("failed to report the ceph cephfs node count. %v", err)
+	} else {
+		telemetry.ReportKeyValue(c.context, c.ClusterInfo, telemetry.CephFSNodeCount, strconv.Itoa(len(cephFSNodelist.Items)))
+	}
+
+	// Report the csi nfs node count
+	listoption = metav1.ListOptions{LabelSelector: fmt.Sprintf("%s=%s", k8sutil.AppAttr, csi.CsiNFSPlugin)}
+	cephNFSNodelist, err := c.context.Clientset.CoreV1().Pods(operatorNamespace).List(c.ClusterInfo.Context, listoption)
+	if err != nil {
+		logger.Warningf("failed to report the ceph nfs node count. %v", err)
+	} else {
+		telemetry.ReportKeyValue(c.context, c.ClusterInfo, telemetry.NFSNodeCount, strconv.Itoa(len(cephNFSNodelist.Items)))
+	}
+}
+
 func (c *cluster) configureMsgr2() error {
 	encryptionSetting := "secure"
 	rbdMapOptions := "rbd_default_map_options"
@@ -615,26 +713,21 @@ func (c *cluster) configureMsgr2() error {
 		}
 	}
 	// Set network compression
-	if c.ClusterInfo.CephVersion.IsAtLeastQuincy() {
-		if c.Spec.Network.Connections == nil || c.Spec.Network.Connections.Compression == nil || !c.Spec.Network.Connections.Compression.Enabled {
-			encryptionConfig := []config.Option{
-				{Who: "global", Option: "ms_osd_compress_mode"},
-			}
-			if err := monStore.DeleteAll(encryptionConfig...); err != nil {
-				return errors.Wrap(err, "failed to delete msgr2 compression settings")
-			}
-		} else {
-			globalConfigSettings := map[string]string{
-				"ms_osd_compress_mode": "force",
-			}
-			logger.Infof("setting msgr2 compression mode to %q", "force")
-			if err := monStore.SetAll("global", globalConfigSettings); err != nil {
-				return err
-			}
+	if c.Spec.Network.Connections == nil || c.Spec.Network.Connections.Compression == nil || !c.Spec.Network.Connections.Compression.Enabled {
+		encryptionConfig := []config.Option{
+			{Who: "global", Option: "ms_osd_compress_mode"},
 		}
-
+		if err := monStore.DeleteAll(encryptionConfig...); err != nil {
+			return errors.Wrap(err, "failed to delete msgr2 compression settings")
+		}
 	} else {
-		logger.Warningf("network compression requires Ceph Quincy (v17) or newer, skipping for current ceph %q", c.ClusterInfo.CephVersion.String())
+		globalConfigSettings := map[string]string{
+			"ms_osd_compress_mode": "force",
+		}
+		logger.Infof("setting msgr2 compression mode to %q", "force")
+		if err := monStore.SetAll("global", globalConfigSettings); err != nil {
+			return err
+		}
 	}
 
 	return nil

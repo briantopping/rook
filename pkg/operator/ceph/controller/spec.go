@@ -18,6 +18,8 @@ limitations under the License.
 package controller
 
 import (
+	"context"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path"
@@ -39,6 +41,8 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 const (
@@ -102,11 +106,12 @@ PERIODICITY=%s
 LOG_ROTATE_CEPH_FILE=/etc/logrotate.d/ceph
 LOG_MAX_SIZE=%s
 ROTATE=%s
+ADDITIONAL_LOG_FILES=%s
 
 # edit the logrotate file to only rotate a specific daemon log
 # otherwise we will logrotate log files without reloading certain daemons
 # this might happen when multiple daemons run on the same machine
-sed -i "s|*.log|$CEPH_CLIENT_ID.log|" "$LOG_ROTATE_CEPH_FILE"
+sed -i "s|*.log|$CEPH_CLIENT_ID.log $ADDITIONAL_LOG_FILES|" "$LOG_ROTATE_CEPH_FILE"
 
 # replace default daily with given user input
 sed --in-place "s/daily/$PERIODICITY/g" "$LOG_ROTATE_CEPH_FILE"
@@ -388,8 +393,8 @@ func AdminFlags(cluster *client.ClusterInfo) []string {
 func NetworkBindingFlags(cluster *client.ClusterInfo, spec *cephv1.ClusterSpec) []string {
 	var args []string
 
-	// As of Pacific, Ceph supports dual-stack, so setting IPv6 family without disabling IPv4 binding actually enables dual-stack
-	// This is likely not user's intent, so on Pacific let's make sure to disable IPv4 when IPv6 is selected
+	// Ceph supports dual-stack, so setting IPv6 family without disabling IPv4 binding actually enables dual-stack
+	// This is likely not user's intent, so let's make sure to disable IPv4 when IPv6 is selected
 	if !spec.Network.DualStack {
 		switch spec.Network.IPFamily {
 		case cephv1.IPv4:
@@ -493,19 +498,23 @@ func CheckPodMemory(name string, resources v1.ResourceRequirements, cephPodMinim
 
 	if !podMemoryLimit.IsZero() {
 		// This means LIMIT and REQUEST are either identical or different but still we use LIMIT as a reference
-		if uint64(podMemoryLimit.Value()) < display.MbTob(cephPodMinimumMemory) {
+		// nolint:gosec // G115 int64 to uint64 conversion is reasonabe here
+		upodMemoryLimit := uint64(podMemoryLimit.Value())
+		if upodMemoryLimit < display.MbTob(cephPodMinimumMemory) {
 			// allow the configuration if less than the min, but print a warning
-			logger.Warningf("running the %q daemon(s) with %dMB of ram, but at least %dMB is recommended", name, display.BToMb(uint64(podMemoryLimit.Value())), cephPodMinimumMemory)
+			logger.Warningf("running the %q daemon(s) with %dMB of ram, but at least %dMB is recommended", name, display.BToMb(upodMemoryLimit), cephPodMinimumMemory)
 		}
 
 		// This means LIMIT < REQUEST
 		// Kubernetes will refuse to schedule that pod however it's still valuable to indicate that user's input was incorrect
-		if uint64(podMemoryLimit.Value()) < uint64(podMemoryRequest.Value()) {
+		// nolint:gosec // G115 int64 to uint64 conversion is reasonabe here
+		upodMemoryRequest := uint64(podMemoryRequest.Value())
+		if upodMemoryLimit < upodMemoryRequest {
 			extraErrorLine := `\n
 			User has specified a pod memory limit %dmb below the pod memory request %dmb in the cluster CR.\n
 			Rook will create pods that are expected to fail to serve as a more apparent error indicator to the user.`
 
-			return errors.Errorf(extraErrorLine, display.BToMb(uint64(podMemoryLimit.Value())), display.BToMb(uint64(podMemoryRequest.Value())))
+			return errors.Errorf(extraErrorLine, display.BToMb(upodMemoryLimit), display.BToMb(upodMemoryRequest))
 		}
 	}
 
@@ -725,6 +734,12 @@ func PodSecurityContext() *v1.SecurityContext {
 
 	return &v1.SecurityContext{
 		Privileged: &privileged,
+		Capabilities: &v1.Capabilities{
+			Add: []v1.Capability{},
+			Drop: []v1.Capability{
+				"NET_RAW",
+			},
+		},
 	}
 }
 
@@ -750,12 +765,16 @@ func PrivilegedContext(runAsRoot bool) *v1.SecurityContext {
 		sec.RunAsUser = &rootUser
 	}
 
+	sec.Capabilities = &v1.Capabilities{
+		Add: []v1.Capability{},
+		Drop: []v1.Capability{
+			"NET_RAW",
+		},
+	}
 	return sec
 }
 
-// LogCollectorContainer rotate logs
-func LogCollectorContainer(daemonID, ns string, c cephv1.ClusterSpec) *v1.Container {
-
+func GetLogRotateConfig(c cephv1.ClusterSpec) (resource.Quantity, string) {
 	var maxLogSize resource.Quantity
 	if c.LogCollector.MaxLogSize != nil {
 		size := c.LogCollector.MaxLogSize.Value() / 1000 / 1000
@@ -767,20 +786,31 @@ func LogCollectorContainer(daemonID, ns string, c cephv1.ClusterSpec) *v1.Contai
 		maxLogSize = resource.MustParse(fmt.Sprintf("%dM", size))
 	}
 
+	var periodicity string
+	switch c.LogCollector.Periodicity {
+	case "1h", "hourly":
+		periodicity = "hourly"
+	case "weekly", "monthly":
+		periodicity = c.LogCollector.Periodicity
+	default:
+		periodicity = "daily"
+	}
+
+	return maxLogSize, periodicity
+}
+
+// LogCollectorContainer rotate logs
+func LogCollectorContainer(daemonID, ns string, c cephv1.ClusterSpec, additionalLogFiles ...string) *v1.Container {
+	maxLogSize, periodicity := GetLogRotateConfig(c)
 	rotation := "7"
+
 	if strings.Contains(daemonID, "-client.rbd-mirror") {
 		rotation = "28"
 	}
 
-	var periodicity string
-	if c.LogCollector.Periodicity == "1h" || c.LogCollector.Periodicity == "hourly" {
-		periodicity = "hourly"
-	} else if c.LogCollector.Periodicity == "weekly" || c.LogCollector.Periodicity == "monthly" {
-		periodicity = c.LogCollector.Periodicity
-	} else {
-		periodicity = "daily"
-	}
-
+	// Convert the variadic string slice into a space-separated string
+	additionalLogs := strings.Join(additionalLogFiles, " ")
+	logger.Debugf("additional log file %q will be used for logCollector", additionalLogs)
 	logger.Debugf("setting periodicity to %q. Supported periodicity are hourly, daily, weekly and monthly", periodicity)
 
 	return &v1.Container{
@@ -791,13 +821,33 @@ func LogCollectorContainer(daemonID, ns string, c cephv1.ClusterSpec) *v1.Contai
 			"-e", // Exit immediately if a command exits with a non-zero status.
 			"-m", // Terminal job control, allows job to be terminated by SIGTERM
 			"-c", // Command to run
-			fmt.Sprintf(cronLogRotate, daemonID, periodicity, maxLogSize.String(), rotation),
+			fmt.Sprintf(cronLogRotate, daemonID, periodicity, maxLogSize.String(), rotation, additionalLogs),
 		},
 		Image:           c.CephVersion.Image,
 		ImagePullPolicy: GetContainerImagePullPolicy(c.CephVersion.ImagePullPolicy),
 		VolumeMounts:    DaemonVolumeMounts(config.NewDatalessDaemonDataPathMap(ns, c.DataDirHostPath), "", c.DataDirHostPath),
 		SecurityContext: PodSecurityContext(),
 		Resources:       cephv1.GetLogCollectorResources(c.Resources),
+		// We need a TTY for the bash job control (enabled by -m)
+		TTY: true,
+	}
+}
+
+// rgw operations will be logged in sidecar ops-log
+func RgwOpsLogSidecarContainer(opsLogFile, ns string, c cephv1.ClusterSpec, Resources v1.ResourceRequirements) *v1.Container {
+	return &v1.Container{
+		Name: "ops-log",
+		Command: []string{
+			"bash",
+			"-x", // Enable debugging mode
+			"-c", // Run the following command
+			fmt.Sprintf("tail -n+1 -F %s", path.Join(config.VarLogCephDir, opsLogFile)),
+		},
+		Image:           c.CephVersion.Image,
+		ImagePullPolicy: GetContainerImagePullPolicy(c.CephVersion.ImagePullPolicy),
+		VolumeMounts:    DaemonVolumeMounts(config.NewDatalessDaemonDataPathMap(ns, c.DataDirHostPath), "", c.DataDirHostPath),
+		SecurityContext: PodSecurityContext(),
+		Resources:       Resources,
 		// We need a TTY for the bash job control (enabled by -m)
 		TTY: true,
 	}
@@ -897,4 +947,57 @@ func GetContainerImagePullPolicy(containerImagePullPolicy v1.PullPolicy) v1.Pull
 	}
 
 	return containerImagePullPolicy
+}
+
+// GenerateLivenessProbeTcpPort generates a liveness probe that makes sure a daemon has
+// TCP a socket binded to specific port, and may create new connection.
+func GenerateLivenessProbeTcpPort(port, failureThreshold int32) *v1.Probe {
+	return &v1.Probe{
+		ProbeHandler: v1.ProbeHandler{
+			TCPSocket: &v1.TCPSocketAction{
+				Port: intstr.IntOrString{IntVal: port},
+			},
+		},
+		InitialDelaySeconds: livenessProbeInitialDelaySeconds,
+		TimeoutSeconds:      livenessProbeTimeoutSeconds,
+		FailureThreshold:    failureThreshold,
+	}
+}
+
+// GenerateLivenessProbeViaRpcinfo creates a liveness probe using 'rpcinfo' shell
+// command which checks that the local NFS daemon has TCP a socket binded to
+// specific port, and it has valid reply to NULL RPC request.
+func GenerateLivenessProbeViaRpcinfo(port uint16, failureThreshold int32) *v1.Probe {
+	bb := make([]byte, 2)
+	binary.BigEndian.PutUint16(bb, port) // port-num in network-order
+	servAddr := fmt.Sprintf("127.0.0.1.%d.%d", bb[0], bb[1])
+	return &v1.Probe{
+		ProbeHandler: v1.ProbeHandler{
+			Exec: &v1.ExecAction{
+				Command: []string{"rpcinfo", "-a", servAddr, "-T", "tcp", "nfs", "4"},
+			},
+		},
+		InitialDelaySeconds: livenessProbeInitialDelaySeconds,
+		TimeoutSeconds:      livenessProbeTimeoutSeconds,
+		FailureThreshold:    failureThreshold,
+	}
+}
+
+func GetDaemonsToSkipReconcile(ctx context.Context, clusterd *clusterd.Context, namespace, daemonName, label string) (sets.Set[string], error) {
+	listOpts := metav1.ListOptions{LabelSelector: fmt.Sprintf("%s=%s,%s", k8sutil.AppAttr, label, cephv1.SkipReconcileLabelKey)}
+
+	deployments, err := clusterd.Clientset.AppsV1().Deployments(namespace).List(ctx, listOpts)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to query %q to skip reconcile", daemonName)
+	}
+
+	result := sets.New[string]()
+	for _, deployment := range deployments.Items {
+		if daemonID, ok := deployment.Labels[daemonName]; ok {
+			logger.Infof("found %s %q pod to skip reconcile", daemonID, daemonName)
+			result.Insert(daemonID)
+		}
+	}
+
+	return result, nil
 }

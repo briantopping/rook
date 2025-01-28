@@ -218,7 +218,7 @@ func TestCephNFSController(t *testing.T) {
 	}
 
 	currentAndDesiredCephVersion = func(ctx context.Context, rookImage string, namespace string, jobName string, ownerInfo *k8sutil.OwnerInfo, context *clusterd.Context, cephClusterSpec *cephv1.ClusterSpec, clusterInfo *cephclient.ClusterInfo) (*version.CephVersion, *version.CephVersion, error) {
-		return &version.Quincy, &version.Quincy, nil
+		return &version.Squid, &version.Squid, nil
 	}
 
 	t.Run("error - no ceph cluster", func(t *testing.T) {
@@ -507,7 +507,7 @@ func TestGetGaneshaConfigObject(t *testing.T) {
 	expectedName := "conf-nfs.my-nfs"
 
 	res := getGaneshaConfigObject(cephNFS)
-	logger.Infof("Config Object for Pacific is %s", res)
+	logger.Infof("Config Object is %s", res)
 	assert.Equal(t, expectedName, res)
 }
 

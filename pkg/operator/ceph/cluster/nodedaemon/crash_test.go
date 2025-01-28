@@ -50,7 +50,7 @@ func TestCreateOrUpdateCephCrash(t *testing.T) {
 	}
 	cephCluster.Spec.Labels = cephv1.LabelsSpec{}
 	cephCluster.Spec.PriorityClassNames = cephv1.PriorityClassNamesSpec{}
-	cephVersion := &cephver.CephVersion{Major: 16, Minor: 2, Extra: 0}
+	cephVersion := &cephver.CephVersion{Major: 17, Minor: 2, Extra: 0}
 	ctx := context.TODO()
 	context := &clusterd.Context{
 		Clientset:     test.New(t, 1),
@@ -75,7 +75,7 @@ func TestCreateOrUpdateCephCrash(t *testing.T) {
 	res, err := r.createOrUpdateCephCrash(node, tolerations, cephCluster, cephVersion)
 	assert.NoError(t, err)
 	assert.Equal(t, controllerutil.OperationResult("created"), res)
-	name := k8sutil.TruncateNodeName(fmt.Sprintf("%s-%%s", crashCollectorAppName), "testnode")
+	name := k8sutil.TruncateNodeName(fmt.Sprintf("%s-%%s", CrashCollectorAppName), "testnode")
 	deploy := appsv1.Deployment{}
 	err = r.client.Get(ctx, types.NamespacedName{Namespace: "rook-ceph", Name: name}, &deploy)
 	assert.NoError(t, err)

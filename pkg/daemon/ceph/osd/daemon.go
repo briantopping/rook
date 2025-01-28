@@ -33,7 +33,6 @@ import (
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/daemon/ceph/client"
 	oposd "github.com/rook/rook/pkg/operator/ceph/cluster/osd"
-	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/util/sys"
 )
 
@@ -180,10 +179,6 @@ func Provision(context *clusterd.Context, agent *OsdAgent, crushLocation, topolo
 	// set the initial orchestration status
 	status := oposd.OrchestrationStatus{Status: oposd.OrchestrationStatusOrchestrating}
 	oposd.UpdateNodeOrPVCStatus(agent.clusterInfo.Context, agent.kv, agent.nodeName, status)
-
-	if err := client.WriteCephConfig(context, agent.clusterInfo); err != nil {
-		return errors.Wrap(err, "failed to generate ceph config")
-	}
 
 	logger.Infof("discovering hardware")
 
@@ -399,13 +394,6 @@ func getAvailableDevices(context *clusterd.Context, agent *OsdAgent) (*DeviceOsd
 			}
 		}
 
-		if device.Type == sys.LoopType {
-			if !agent.clusterInfo.CephVersion.IsAtLeast(cephver.CephVersion{Major: 17, Minor: 2, Extra: 4}) {
-				logger.Infof("partition %q is not picked because loop devices are not allowed on Ceph clusters older than v17.2.4", device.Name)
-				continue
-			}
-		}
-
 		// Check if the desired device is available
 		//
 		// We need to use the /dev path, provided by the NAME property from "lsblk --paths",
@@ -445,6 +433,11 @@ func getAvailableDevices(context *clusterd.Context, agent *OsdAgent) (*DeviceOsd
 			continue
 		}
 		logger.Infof("device %q is available.", device.Name)
+
+		if device.Type == sys.PartType && agent.storeConfig.EncryptedDevice {
+			logger.Infof("partition %q is not picked because encrypted OSD on partition is not allowed", device.Name)
+			continue
+		}
 
 		var deviceInfo *DeviceOsdIDEntry
 		if agent.metadataDevice != "" && agent.metadataDevice == device.Name {

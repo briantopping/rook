@@ -22,6 +22,7 @@ spec:
         {{ $key }}: "{{ $value }}"
         {{ end }}
     spec:
+      securityContext: {}
       serviceAccountName: rook-csi-rbd-plugin-sa
       {{ if .PluginPriorityClassName }}
       priorityClassName: {{ .PluginPriorityClassName }}
@@ -39,6 +40,7 @@ spec:
           securityContext:
             privileged: true
             capabilities:
+              add: []
               drop: ["ALL"]
           image: {{ .RegistrarImage }}
           imagePullPolicy: {{ .ImagePullPolicy }}
@@ -72,19 +74,17 @@ spec:
             - "--nodeserver=true"
             - "--drivername={{ .DriverNamePrefix }}rbd.csi.ceph.com"
             - "--pidlimit=-1"
-            - "--metricsport={{ .RBDGRPCMetricsPort }}"
-            - "--metricspath=/metrics"
-            - "--enablegrpcmetrics={{ .EnableCSIGRPCMetrics }}"
             - "--stagingpath={{ .KubeletDirPath }}/plugins/kubernetes.io/csi/"
+            {{ if .CSILogRotation }}
+            - "--logtostderr=false"
+            - "--alsologtostderr=true"
+            - "--log_file={{ .CsiLogRootPath }}/log/{{ .CsiComponentName }}/csi-rbdplugin.log"
+            {{ end }}
             {{ if .EnableCSIAddonsSideCar }}
             - "--csi-addons-endpoint=$(CSIADDONS_ENDPOINT)"
             {{ end }}
             {{- if .EnableCSITopology }}
             - "--domainlabels={{ .CSIDomainLabels }}"
-            {{- end }}
-            {{- if .EnableReadAffinity }}
-            - "--enable-read-affinity=true"
-            - "--crush-location-labels={{ .CrushLocationLabels }}"
             {{- end }}
           env:
             - name: POD_IP
@@ -128,6 +128,10 @@ spec:
               mountPath: /tmp/csi/keys
             - name: host-run-mount
               mountPath: /run/mount
+            {{ if .CSILogRotation }}
+            - mountPath: {{ .CsiLogRootPath }}/log/{{ .CsiComponentName }}
+              name: csi-log
+            {{ end }}
             {{ if .EnablePluginSelinuxHostMount }}
             - name: etc-selinux
               mountPath: /etc/selinux
@@ -150,6 +154,7 @@ spec:
           securityContext:
             privileged: true
             capabilities:
+              add: []
               drop: ["ALL"]
           image: {{ .CSIAddonsImage }}
           args :
@@ -161,6 +166,11 @@ spec:
             - "--namespace=$(POD_NAMESPACE)"
             - "--pod-uid=$(POD_UID)"
             - "--stagingpath={{ .KubeletDirPath }}/plugins/kubernetes.io/csi/"
+            {{ if .CSILogRotation }}
+            - "--logtostderr=false"
+            - "--alsologtostderr=true"
+            - "--log_file={{ .CsiLogRootPath }}/log/{{ .CsiComponentName }}/csi-addons.log"
+            {{ end }}
           ports:
             - containerPort: {{ .CSIAddonsPort }}
           env:
@@ -186,12 +196,17 @@ spec:
           volumeMounts:
             - name: plugin-dir
               mountPath: /csi
+            {{ if .CSILogRotation }}
+            - mountPath: {{ .CsiLogRootPath }}/log/{{ .CsiComponentName }}
+              name: csi-log
+            {{ end }}
         {{ end }}
         {{ if .EnableLiveness }}
         - name: liveness-prometheus
           securityContext:
             privileged: true
             capabilities:
+              add: []
               drop: ["ALL"]
           image: {{ .CSIPluginImage }}
           args:
@@ -218,6 +233,15 @@ spec:
           hostPath:
             path: "{{ .KubeletDirPath }}/plugins/{{ .DriverNamePrefix }}rbd.csi.ceph.com"
             type: DirectoryOrCreate
+        {{ if .CSILogRotation }}
+        - name: csi-log
+          hostPath:
+            path: {{ .CsiLogRootPath }}/log/{{ .CsiComponentName }}
+            type: DirectoryOrCreate
+        - name: csi-logs-logrotate
+          emptyDir:
+            type: DirectoryOrCreate
+        {{ end }}
         - name: plugin-mount-dir
           hostPath:
             path: "{{ .KubeletDirPath }}/plugins"
